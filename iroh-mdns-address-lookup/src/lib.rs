@@ -449,9 +449,9 @@ impl MdnsAddressLookup {
                             continue;
                         }
 
-                        let entry = endpoint_addrs.entry(discovered_endpoint_id);
-                        if let std::collections::hash_map::Entry::Occupied(ref entry) = entry
-                            && peer_content_eq(entry.get(), &peer_info)
+                        if endpoint_addrs
+                            .get(&discovered_endpoint_id)
+                            .is_some_and(|known| peer_content_eq(known, &peer_info))
                         {
                             // this is a republish we already know about
                             continue;
@@ -472,7 +472,7 @@ impl MdnsAddressLookup {
                                 sender.send(Ok(item.clone())).await.ok();
                             }
                         }
-                        entry.or_insert(peer_info);
+                        endpoint_addrs.insert(discovered_endpoint_id, peer_info);
 
                         // only send endpoints to the `subscriber` if they weren't explicitly resolved
                         // in other words, endpoints sent to the `subscribers` should only be the ones that
@@ -537,13 +537,14 @@ impl MdnsAddressLookup {
         })
     }
 
-    /// Returns the IPv4 interface addresses currently used for multicast.
+    /// Returns the IPv4 interface addresses requested for multicast.
     ///
-    /// Primarily useful for diagnostics. The set is empty until the network
-    /// monitor has reported the initial interface state, and stays empty when
-    /// the host has no usable non-loopback IPv4 interface; in both cases
-    /// swarm-discovery operates on a single wildcard socket bound to the
-    /// default interface.
+    /// Primarily useful for diagnostics. This is the desired interface set
+    /// derived from the network monitor; socket creation failures are logged by
+    /// swarm-discovery. The set is empty until the network monitor has reported
+    /// the initial interface state, and stays empty when the host has no usable
+    /// non-loopback IPv4 interface; in both cases swarm-discovery operates on a
+    /// single wildcard socket bound to the default interface.
     pub fn multicast_interfaces(&self) -> BTreeSet<Ipv4Addr> {
         self.multicast_interfaces.read().expect("poisoned").clone()
     }
@@ -1255,6 +1256,74 @@ mod tests {
                 Err(_) => Ok(()),
                 Ok(result) => result,
             }
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn changed_info_updates_cache_and_dedups_republish() -> Result {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+
+            let (_, address_lookup_a) = make_address_lookup(&mut rng, false)?;
+            let (endpoint_id_b, address_lookup_b) = make_address_lookup(&mut rng, true)?;
+
+            let endpoint_data_a =
+                EndpointData::from_iter([TransportAddr::Ip("0.0.0.0:11111".parse().unwrap())]);
+            let endpoint_data_b =
+                EndpointData::from_iter([TransportAddr::Ip("0.0.0.0:22222".parse().unwrap())]);
+
+            let mut events = address_lookup_a.subscribe().await;
+            address_lookup_b.publish(&endpoint_data_a);
+            wait_for_discovered(&mut events, endpoint_id_b).await?;
+
+            address_lookup_b.publish(&endpoint_data_b);
+            let updated = wait_for_discovered(&mut events, endpoint_id_b).await?;
+            assert_eq!(updated.data, endpoint_data_b);
+
+            let mut resolved = address_lookup_a.resolve(endpoint_id_b).unwrap();
+            let item = tokio::time::timeout(Duration::from_secs(2), resolved.next())
+                .await
+                .std_context("timeout resolving updated endpoint info")?
+                .expect("resolved stream should yield updated endpoint info")?;
+            assert_eq!(item.endpoint_info().data, endpoint_data_b);
+
+            let observe = async {
+                while let Some(event) = events.next().await {
+                    if let DiscoveryEvent::Discovered { endpoint_info, .. } = event
+                        && endpoint_info.endpoint_id == endpoint_id_b
+                    {
+                        bail_any!(
+                            "received duplicate Discovered event for unchanged updated content"
+                        );
+                    }
+                }
+                Ok(())
+            };
+            match tokio::time::timeout(Duration::from_secs(3), observe).await {
+                Err(_) => Ok(()),
+                Ok(result) => result,
+            }
+        }
+
+        async fn wait_for_discovered(
+            events: &mut (impl Stream<Item = DiscoveryEvent> + Unpin),
+            endpoint_id: PublicKey,
+        ) -> Result<EndpointInfo> {
+            let next = async {
+                loop {
+                    match events.next().await {
+                        Some(DiscoveryEvent::Discovered { endpoint_info, .. })
+                            if endpoint_info.endpoint_id == endpoint_id =>
+                        {
+                            return Ok::<_, Error>(endpoint_info);
+                        }
+                        Some(_) => continue,
+                        None => bail_any!("event stream ended unexpectedly"),
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), next)
+                .await
+                .std_context("timeout waiting for discovery")?
         }
 
         fn make_address_lookup<R: CryptoRng + ?Sized>(
