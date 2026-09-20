@@ -356,7 +356,7 @@ impl MdnsAddressLookup {
             loop {
                 trace!(?endpoint_addrs, "Mdns Service loop tick");
                 let msg = tokio::select! {
-                    msg = recv.recv() => {
+                    msg = receive_message(&mut recv, &mut timeouts) => {
                         msg
                     }
                     state = async { interface_state.as_mut().expect("guarded by if-branch").updated().await }, if interface_state.is_some() => {
@@ -760,8 +760,55 @@ impl AddressLookup for MdnsAddressLookup {
     }
 }
 
+// Keep completed timeout tasks out of the long-lived lookup task's JoinSet.
+async fn receive_message(
+    recv: &mut mpsc::Receiver<Message>,
+    timeouts: &mut JoinSet<()>,
+) -> Option<Message> {
+    loop {
+        tokio::select! {
+            msg = recv.recv() => return msg,
+            _ = timeouts.join_next(), if !timeouts.is_empty() => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+
+    #[tokio::test]
+    async fn receiver_keeps_pending_timeouts_and_delivers_messages() {
+        let (sender, mut recv) = mpsc::channel(1);
+        let mut timeouts = JoinSet::new();
+        timeouts.spawn(std::future::pending::<()>());
+        let endpoint_id = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
+        sender.try_send(Message::Timeout(endpoint_id, 42)).unwrap();
+        assert!(matches!(receive_message(&mut recv, &mut timeouts).await,
+            Some(Message::Timeout(id, 42)) if id == endpoint_id));
+        assert_eq!(timeouts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_receiver_releases_completed_timeouts() {
+        let (sender, mut recv) = mpsc::channel(1);
+        let mut timeouts = JoinSet::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        timeouts.spawn(async move {
+            done_tx.send(()).unwrap();
+        });
+        done_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            receive_message(&mut recv, &mut timeouts)
+                .now_or_never()
+                .is_none()
+        );
+        assert!(timeouts.is_empty(), "completed timeout retained while idle");
+        drop(sender);
+        assert!(receive_message(&mut recv, &mut timeouts).await.is_none());
+    }
 
     /// Pure unit tests that do not open sockets, safe to run concurrently.
     mod unit {
